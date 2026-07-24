@@ -1,730 +1,484 @@
-{
- "cells": [
-  {
-   "cell_type": "markdown",
-   "metadata": {},
-   "source": [
-    "# CARLA Python API - Project 5: Cooperative Roadside Assistant (V2X / I2V)\n",
-    "\n",
-    "This notebook contains exactly 3 sections:\n",
-    "1. **Infrastructure Sensing & World Transformation** (Theory, camera setups, and 2D-to-3D projection layout)\n",
-    "2. **V2X MQTT Server Architecture & Message Serialization** (Live MQTT client setup, network delay emulation, and protocol payloads)\n",
-    "3. **End-to-End System Integration & Occlusion Scenarios** (The runnable project execution with full evaluation metrics)\n",
-    "\n",
-    "## CARLA docs\n",
-    "- Main docs: https://carla.readthedocs.io/en/latest/\n",
-    "- Sensors reference: https://carla.readthedocs.io/en/latest/ref_sensors/\n",
-    "- Python API: https://carla.readthedocs.io/en/latest/python_api/"
-   ]
-  },
-  {
-   "cell_type": "code",
-   "execution_count": null,
-   "metadata": {},
-   "outputs": [],
-   "source": [
-    "import carla\n",
-    "import time\n",
-    "import random\n",
-    "import cv2\n",
-    "import queue\n",
-    "import threading\n",
-    "import math\n",
-    "import numpy as np\n",
-    "\n",
-    "# ==============================================================================\n",
-    "# CELL 1: CORE UTILITIES AND CONNECTION\n",
-    "# ==============================================================================\n",
-    "\n",
-    "def move_spectator_to(transform, spectator, distance=12.0, z=6.0, pitch=-25.0):\n",
-    "    \"\"\"Utility to orient the editor spectator view behind an active actor.\"\"\"\n",
-    "    back = transform.location - transform.get_forward_vector() * distance\n",
-    "    loc = carla.Location(back.x, back.y, back.z + z)\n",
-    "    rot = carla.Rotation(pitch=pitch, yaw=transform.rotation.yaw, roll=0.0)\n",
-    "    spectator.set_transform(carla.Transform(loc, rot))\n",
-    "\n",
-    "def safe_destroy(actors):\n",
-    "    \"\"\"Safely removes lists of actors under teardown scenarios.\"\"\"\n",
-    "    for a in actors:\n",
-    "        if a is not None:\n",
-    "            try:\n",
-    "                a.destroy()\n",
-    "            except RuntimeError:\n",
-    "                pass\n",
-    "\n",
-    "# Connect to CARLA Simulator\n",
-    "client = carla.Client(\"localhost\", 2000)\n",
-    "client.set_timeout(20.0)\n",
-    "print(\"Connected to CARLA server.\")"
-   ]
-  },
-  {
-   "cell_type": "code",
-   "execution_count": 2,
-   "metadata": {},
-   "outputs": [
-    {
-     "name": "stdout",
-     "output_type": "stream",
-     "text": [
-      "V2X broker and RSU camera loop defined.\n"
-     ]
-    }
-   ],
-   "source": [
-    "# ==============================================================================\n",
-    "# CELL 2: V2X BROKER + RSU CAMERA LOOP\n",
-    "# FIX 3: Added SIMULATED_V2X_LATENCY_MS and tx_time to every message so\n",
-    "#         the ego side can measure real end-to-end message delay.\n",
-    "# ==============================================================================\n",
-    "\n",
-    "# Simulated radio latency in milliseconds (realistic DSRC range: 20-80 ms)\n",
-    "SIMULATED_V2X_LATENCY_MS = 50\n",
-    "\n",
-    "# Global broker queue — RSU writes here, ego vehicle reads from here\n",
-    "v2x_broker_channel = queue.Queue(maxsize=20)\n",
-    "\n",
-    "# FIX 4: Global flag so the ego camera HUD knows when to show the red warning\n",
-    "v2x_hud_alert_triggered = False\n",
-    "\n",
-    "def roadside_unit_camera_loop(rsu_sensor, target_actors, stop_event):\n",
-    "    \"\"\"\n",
-    "    Simulates a smart infrastructure RSU camera tracking hidden VRUs.\n",
-    "    On every camera frame:\n",
-    "      1. Reads ground-truth positions of all tracked VRUs\n",
-    "      2. Waits SIMULATED_V2X_LATENCY_MS to emulate radio transmission delay\n",
-    "      3. Publishes a timestamped message to the shared broker queue\n",
-    "    \"\"\"\n",
-    "    frame_queue = queue.Queue(maxsize=1)\n",
-    "    rsu_sensor.listen(lambda img: frame_queue.put(img) if not frame_queue.full() else None)\n",
-    "\n",
-    "    # Handle single actor passed instead of a list\n",
-    "    if not isinstance(target_actors, (list, tuple, set)):\n",
-    "        target_actors = [target_actors]\n",
-    "\n",
-    "    while not stop_event.is_set():\n",
-    "        try:\n",
-    "            image = frame_queue.get(timeout=0.2)\n",
-    "            capture_time = time.time()       # exact moment the camera saw the scene\n",
-    "            v2x_payload = []\n",
-    "\n",
-    "            for actor in target_actors:\n",
-    "                if actor is not None and actor.is_alive:\n",
-    "                    tf  = actor.get_transform()\n",
-    "                    vel = actor.get_velocity()\n",
-    "                    v2x_payload.append({\n",
-    "                        \"id\":    actor.id,\n",
-    "                        \"type\":  \"Cyclist\" if \"bicycle\" in actor.type_id else \"Pedestrian\",\n",
-    "                        \"pos_x\": tf.location.x,\n",
-    "                        \"pos_y\": tf.location.y,\n",
-    "                        \"pos_z\": tf.location.z,\n",
-    "                        \"speed\": 3.6 * math.sqrt(vel.x**2 + vel.y**2 + vel.z**2)\n",
-    "                    })\n",
-    "\n",
-    "            # FIX 3: Simulate radio transmission delay before publishing\n",
-    "            time.sleep(SIMULATED_V2X_LATENCY_MS / 1000.0)\n",
-    "\n",
-    "            if not v2x_broker_channel.full():\n",
-    "                v2x_broker_channel.put({\n",
-    "                    \"capture_time\": capture_time,           # when RSU camera saw the VRU\n",
-    "                    \"tx_time\":      time.time(),            # when message arrived after delay\n",
-    "                    \"timestamp\":    image.timestamp,        # CARLA simulation timestamp\n",
-    "                    \"objects\":      v2x_payload\n",
-    "                })\n",
-    "\n",
-    "            # Render RSU feed in OpenCV window\n",
-    "            arr = np.frombuffer(image.raw_data, dtype=np.uint8)\n",
-    "            arr = np.reshape(arr, (image.height, image.width, 4))\n",
-    "            bgr_frame = arr[:, :, :3].copy()\n",
-    "            cv2.putText(bgr_frame, f\"RSU INFRASTRUCTURE FEED | {len(v2x_payload)} VRU(s) TRACKED\",\n",
-    "                        (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)\n",
-    "            cv2.imshow(\"RSU Infrastructure Perception Feed\", bgr_frame)\n",
-    "            cv2.waitKey(1)\n",
-    "\n",
-    "        except queue.Empty:\n",
-    "            continue\n",
-    "\n",
-    "    rsu_sensor.stop()\n",
-    "    cv2.destroyWindow(\"RSU Infrastructure Perception Feed\")\n",
-    "\n",
-    "print(\"V2X broker and RSU camera loop defined.\")"
-   ]
-  },
-  {
-   "cell_type": "code",
-   "execution_count": 3,
-   "metadata": {},
-   "outputs": [
-    {
-     "name": "stdout",
-     "output_type": "stream",
-     "text": [
-      "Ego camera loop defined.\n"
-     ]
-    }
-   ],
-   "source": [
-    "# ==============================================================================\n",
-    "# CELL 3: EGO ONBOARD CAMERA LOOP\n",
-    "# FIX 4: Restored the red HUD warning banner that shows when V2X fires.\n",
-    "#         The global flag v2x_hud_alert_triggered is set in the scenario loops.\n",
-    "# ==============================================================================\n",
-    "\n",
-    "def local_onboard_camera_loop(cam_sensor, stop_event, mode_string=\"UNASSISTED\"):\n",
-    "    \"\"\"\n",
-    "    Displays the ego vehicle's front camera feed in an OpenCV window.\n",
-    "    In V2X-COOPERATIVE mode, shows a red warning banner when the RSU\n",
-    "    detects a hidden VRU (v2x_hud_alert_triggered flag).\n",
-    "    \"\"\"\n",
-    "    global v2x_hud_alert_triggered\n",
-    "    frame_queue = queue.Queue(maxsize=1)\n",
-    "    cam_sensor.listen(lambda img: frame_queue.put(img) if not frame_queue.full() else None)\n",
-    "\n",
-    "    while not stop_event.is_set():\n",
-    "        try:\n",
-    "            image = frame_queue.get(timeout=0.2)\n",
-    "            arr = np.frombuffer(image.raw_data, dtype=np.uint8)\n",
-    "            arr = np.reshape(arr, (image.height, image.width, 4))\n",
-    "            bgr_frame = arr[:, :, :3].copy()\n",
-    "\n",
-    "            # Dark header bar\n",
-    "            cv2.rectangle(bgr_frame, (0, 0), (640, 60), (15, 15, 15), -1)\n",
-    "\n",
-    "            # FIX 4: Show red alert banner when V2X warning is active\n",
-    "            if mode_string == \"V2X-COOPERATIVE\" and v2x_hud_alert_triggered:\n",
-    "                cv2.rectangle(bgr_frame, (5, 5), (635, 55), (0, 0, 255), 3)\n",
-    "                cv2.putText(bgr_frame, \"WARNING: HIDDEN VRU DETECTED BY RSU  SLOWING DOWN\",\n",
-    "                            (18, 37), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2)\n",
-    "            else:\n",
-    "                color = (0, 0, 255) if mode_string == \"UNASSISTED\" else (0, 255, 0)\n",
-    "                cv2.putText(bgr_frame, f\"EGO LOCAL VIEW | MODE: {mode_string}\",\n",
-    "                            (20, 37), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)\n",
-    "\n",
-    "            cv2.imshow(\"Ego Local View Window\", bgr_frame)\n",
-    "            cv2.waitKey(1)\n",
-    "\n",
-    "        except queue.Empty:\n",
-    "            continue\n",
-    "\n",
-    "    cam_sensor.stop()\n",
-    "    cv2.destroyWindow(\"Ego Local View Window\")\n",
-    "\n",
-    "print(\"Ego camera loop defined.\")"
-   ]
-  },
-  {
-   "cell_type": "code",
-   "execution_count": null,
-   "metadata": {},
-   "outputs": [
-    {
-     "name": "stdout",
-     "output_type": "stream",
-     "text": [
-      "[DETECTOR] Initialized OpenCV HOG Pedestrian Detector.\n"
-     ]
-    }
-   ],
-   "source": [
-    "import time\n",
-    "import math\n",
-    "import random\n",
-    "import collections\n",
-    "import numpy as np\n",
-    "import cv2\n",
-    "import carla\n",
-    "\n",
-    "# Force-use OpenCV's built-in HOG Pedestrian Detector (Lightweight, No YOLO)\n",
-    "hog = cv2.HOGDescriptor()\n",
-    "hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())\n",
-    "print(\"[DETECTOR] Initialized OpenCV HOG Pedestrian Detector.\")\n",
-    "\n",
-    "# Thread-safe storage for the latest camera frames\n",
-    "latest_frames = {\n",
-    "    \"ego\": None,\n",
-    "    \"rsu\": None\n",
-    "}\n",
-    "\n",
-    "# Global V2X Message Data Box\n",
-    "v2x_message_box = {\n",
-    "    \"timestamp\": 0.0,\n",
-    "    \"vru_detected\": False,\n",
-    "    \"vru_type\": \"pedestrian\",\n",
-    "    \"est_location\": None\n",
-    "}\n",
-    "\n",
-    "# Global Onboard Perception Data Box\n",
-    "local_cam_box = {\n",
-    "    \"vru_detected\": False\n",
-    "}\n",
-    "\n",
-    "# Queue to simulate V2X network latency (delay)\n",
-    "v2x_latency_queue = collections.deque(maxlen=3)\n",
-    "\n",
-    "def camera_callback_ego(image):\n",
-    "    \"\"\"Saves frame safely in the background thread\"\"\"\n",
-    "    img_array = np.frombuffer(image.raw_data, dtype=np.uint8)\n",
-    "    img_array = np.reshape(img_array, (image.height, image.width, 4))\n",
-    "    latest_frames[\"ego\"] = img_array[:, :, :3].copy()\n",
-    "\n",
-    "def camera_callback_rsu(image):\n",
-    "    \"\"\"Saves frame safely in the background thread\"\"\"\n",
-    "    img_array = np.frombuffer(image.raw_data, dtype=np.uint8)\n",
-    "    img_array = np.reshape(img_array, (image.height, image.width, 4))\n",
-    "    latest_frames[\"rsu\"] = img_array[:, :, :3].copy()\n",
-    "\n",
-    "def detect_pedestrians_hog(img_bgr):\n",
-    "    \"\"\"\n",
-    "    Runs classical OpenCV HOG pedestrian detection using positional arguments\n",
-    "    to bypass Python keyword argument wrapper bugs.\n",
-    "    \"\"\"\n",
-    "    if img_bgr is None:\n",
-    "        return None, False\n",
-    "        \n",
-    "    pedestrian_detected = False\n",
-    "    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)\n",
-    "    \n",
-    "    # Define parameters clearly to ignore noise like streetlights\n",
-    "    hit_threshold = 0.3         \n",
-    "    win_stride = (8, 8)         \n",
-    "    padding = (8, 8)            \n",
-    "    scale = 1.05                \n",
-    "    final_threshold = 2.0       \n",
-    "\n",
-    "    boxes, weights = hog.detectMultiScale(\n",
-    "        gray, \n",
-    "        hit_threshold, \n",
-    "        win_stride, \n",
-    "        padding, \n",
-    "        scale, \n",
-    "        final_threshold\n",
-    "    )\n",
-    "    \n",
-    "    for (x, y, w, h) in boxes:\n",
-    "        # Aspect Ratio Filter: standard human is between 0.2 and 0.6 width-to-height\n",
-    "        aspect_ratio = float(w) / h\n",
-    "        \n",
-    "        # Discards vertical street lamps (which are incredibly thin, e.g., ratio < 0.2)\n",
-    "        if 0.2 < aspect_ratio < 0.6 and h > 40:\n",
-    "            pedestrian_detected = True\n",
-    "            \n",
-    "            # Draw bounding box\n",
-    "            cv2.rectangle(img_bgr, (x, y), (x + w, y + h), (0, 255, 0), 2)\n",
-    "            cv2.putText(img_bgr, \"Pedestrian\", (x, y - 10),\n",
-    "                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)\n",
-    "            \n",
-    "    return img_bgr, pedestrian_detected\n",
-    "\n",
-    "def run_scenario(map_name, weather_preset, scenario_id, v2x_assisted, client, safe_destroy, move_spectator_to, local_onboard_camera_loop, roadside_unit_camera_loop):\n",
-    "    print(f\"\\n\" + \"=\"*80)\n",
-    "    mode_str = \"ASSISTED (V2X)\" if v2x_assisted else \"UNASSISTED (BASELINE)\"\n",
-    "    print(f\"LAUNCHING {mode_str} SCENARIO {scenario_id}\")\n",
-    "    print(\"=\"*80)\n",
-    "\n",
-    "    world = client.load_world(map_name)\n",
-    "    world.set_weather(weather_preset)\n",
-    "    blueprint_library = world.get_blueprint_library()\n",
-    "    spectator = world.get_spectator()\n",
-    "\n",
-    "    original_settings = world.get_settings()\n",
-    "    settings = world.get_settings()\n",
-    "    settings.synchronous_mode = True\n",
-    "    settings.fixed_delta_seconds = 0.04\n",
-    "    world.apply_settings(settings)\n",
-    "\n",
-    "    trial_actors = []\n",
-    "    vru_group    = []\n",
-    "    \n",
-    "    # Reset communication states\n",
-    "    v2x_message_box[\"vru_detected\"] = False\n",
-    "    local_cam_box[\"vru_detected\"] = False\n",
-    "    v2x_latency_queue.clear()\n",
-    "    latest_frames[\"ego\"] = None\n",
-    "    latest_frames[\"rsu\"] = None\n",
-    "\n",
-    "    min_distance_to_target = float(\"inf\")\n",
-    "    collision_detected     = False\n",
-    "    speed_at_brake_trigger = 0.0\n",
-    "    brake_timestamp        = None\n",
-    "    autopilot_disabled     = False    \n",
-    "    stop_time_start        = None      \n",
-    "\n",
-    "    # Throttling timers (Updates only once every 2.0 seconds)\n",
-    "    last_detection_time = 0.0\n",
-    "    DETECTION_INTERVAL = 2.0  # seconds\n",
-    "\n",
-    "    # --- Determine Debug Text & Color based on Weather and V2X Assistance ---\n",
-    "    # We check if the weather preset contains rain features to mark it as rain vs good weather\n",
-    "    is_rainy = (weather_preset.cloudiness > 10.0 or weather_preset.precipitation > 10.0)\n",
-    "\n",
-    "    if is_rainy:\n",
-    "        if v2x_assisted:\n",
-    "            hud_text = \"rain weather with assistance\"\n",
-    "            hud_color = carla.Color(0, 255, 0)  # Green\n",
-    "        else:\n",
-    "            hud_text = \"rain weather without assistance\"\n",
-    "            hud_color = carla.Color(255, 0, 0)  # Red\n",
-    "    else:\n",
-    "        if v2x_assisted:\n",
-    "            hud_text = \"good weather with assistance\"\n",
-    "            hud_color = carla.Color(0, 255, 0)  # Green\n",
-    "        else:\n",
-    "            hud_text = \"good weather without assistance\"\n",
-    "            hud_color = carla.Color(255, 0, 0)  # Red\n",
-    "\n",
-    "    try:\n",
-    "        # --- Spawn Configurations ---\n",
-    "        ego_spawn_tf  = carla.Transform(carla.Location(x=120.0, y=132.0, z=2.0), carla.Rotation(yaw=0.0))\n",
-    "        \n",
-    "        # --- ROADSIDE CAMERA ROTATED FURTHER RIGHT ---\n",
-    "        rsu_spawn_tf  = carla.Transform(\n",
-    "            carla.Location(x=135.0, y=141.0, z=6.5), \n",
-    "            carla.Rotation(pitch=-30.0, yaw=-95.0, roll=0.0)\n",
-    "        )\n",
-    "        \n",
-    "        vru_direction = carla.Vector3D(0, -1, 0)\n",
-    "        base_x, base_y, base_z = 130.0, 141.0, 2.5\n",
-    "        vru_count = 6 if scenario_id == 1 else 40\n",
-    "\n",
-    "        # --- Spawn Ego Vehicle ---\n",
-    "        ego_vehicle = world.try_spawn_actor(blueprint_library.filter(\"vehicle.tesla.model3\")[0], ego_spawn_tf)\n",
-    "        if ego_vehicle is None:\n",
-    "            ego_spawn_tf.location.x += 2.0\n",
-    "            ego_vehicle = world.spawn_actor(blueprint_library.filter(\"vehicle.tesla.model3\")[0], ego_spawn_tf)\n",
-    "\n",
-    "        trial_actors.append(ego_vehicle)\n",
-    "        ego_vehicle.set_autopilot(True)\n",
-    "        \n",
-    "        tm = client.get_trafficmanager()\n",
-    "        tm.update_vehicle_lights(ego_vehicle, True)\n",
-    "\n",
-    "        if not v2x_assisted:\n",
-    "            tm.vehicle_percentage_speed_difference(ego_vehicle, -120.0)\n",
-    "            tm.ignore_walkers_percentage(ego_vehicle, 100.0)\n",
-    "        else:\n",
-    "            tm.vehicle_percentage_speed_difference(ego_vehicle, 10.0)\n",
-    "\n",
-    "        # --- Spawn Pedestrians ---\n",
-    "        ped_blueprints = blueprint_library.filter(\"walker.pedestrian.*\")\n",
-    "        for i in range(vru_count):\n",
-    "            bp  = ped_blueprints[i % len(ped_blueprints)]\n",
-    "            vru = None\n",
-    "            for attempt in range(10):\n",
-    "                row     = i // 3\n",
-    "                col     = i % 3\n",
-    "                shift_x = base_x + (col * 1.5) + (attempt * 0.2)\n",
-    "                shift_y = base_y + (row * 1.2) + (attempt * 0.1)\n",
-    "                tf      = carla.Transform(carla.Location(x=shift_x, y=shift_y, z=base_z), carla.Rotation(yaw=-90.0))\n",
-    "                vru     = world.try_spawn_actor(bp, tf)\n",
-    "                if vru is not None:\n",
-    "                    trial_actors.append(vru)\n",
-    "                    vru_group.append(vru)\n",
-    "                    break\n",
-    "\n",
-    "        # --- Spawn Camera Sensors ---\n",
-    "        rgb_camera_bp = blueprint_library.find(\"sensor.camera.rgb\")\n",
-    "        ego_camera = world.spawn_actor(rgb_camera_bp, carla.Transform(carla.Location(x=2.0, z=1.3)), attach_to=ego_vehicle)\n",
-    "        rsu_sensor = world.spawn_actor(rgb_camera_bp, rsu_spawn_tf)\n",
-    "        \n",
-    "        trial_actors.extend([ego_camera, rsu_sensor])\n",
-    "\n",
-    "        # Hook up thread-safe callbacks\n",
-    "        ego_camera.listen(lambda image: camera_callback_ego(image))\n",
-    "        rsu_sensor.listen(lambda image: camera_callback_rsu(image))\n",
-    "\n",
-    "        world.tick()\n",
-    "        time.sleep(0.5)\n",
-    "\n",
-    "        for vru in vru_group:\n",
-    "            vru.apply_control(carla.WalkerControl(direction=vru_direction, speed=3.5 + random.uniform(-0.3, 0.3)))\n",
-    "\n",
-    "        # --- Main Simulation Loop ---\n",
-    "        for frame in range(750):\n",
-    "            world.tick()\n",
-    "            current_sim_time = frame * 0.04\n",
-    "\n",
-    "            ego_tf = ego_vehicle.get_transform()\n",
-    "            move_spectator_to(ego_tf, spectator, distance=15.0, z=6.0, pitch=-22.0)\n",
-    "\n",
-    "            # Draw the static scenario status text continuously above the vehicle\n",
-    "            # life_time=0.04 ensures it clears out and redraws at the next position seamlessly\n",
-    "            world.debug.draw_string(\n",
-    "                ego_tf.location + carla.Location(z=3.2), \n",
-    "                hud_text, \n",
-    "                draw_shadow=True, \n",
-    "                color=hud_color, \n",
-    "                life_time=0.04\n",
-    "            )\n",
-    "\n",
-    "            # Telemetry checks\n",
-    "            current_closest  = float(\"inf\")\n",
-    "            for vru in vru_group:\n",
-    "                if vru.is_alive:\n",
-    "                    dist = ego_tf.location.distance(vru.get_transform().location)\n",
-    "                    if dist < current_closest:\n",
-    "                        current_closest = dist\n",
-    "\n",
-    "            if current_closest < min_distance_to_target:\n",
-    "                min_distance_to_target = current_closest\n",
-    "            if current_closest < 1.95:\n",
-    "                collision_detected = True\n",
-    "\n",
-    "            vel       = ego_vehicle.get_velocity()\n",
-    "            speed_kmh = 3.6 * math.sqrt(vel.x**2 + vel.y**2 + vel.z**2)\n",
-    "\n",
-    "            # =======================================================\n",
-    "            # THROTTLED PROCESSING (Only runs detection every 2.0s)\n",
-    "            # =======================================================\n",
-    "            if current_sim_time - last_detection_time >= DETECTION_INTERVAL:\n",
-    "                last_detection_time = current_sim_time\n",
-    "                \n",
-    "                # 1. Process and show Front Ego Camera\n",
-    "                if latest_frames[\"ego\"] is not None:\n",
-    "                    vis_ego, ego_detected = detect_pedestrians_hog(latest_frames[\"ego\"])\n",
-    "                    local_cam_box[\"vru_detected\"] = ego_detected\n",
-    "                    cv2.imshow(\"Ego Front Camera (Throttled HOG)\", vis_ego)\n",
-    "\n",
-    "                # 2. Process and show Roadside Camera\n",
-    "                if latest_frames[\"rsu\"] is not None:\n",
-    "                    vis_rsu, rsu_detected = detect_pedestrians_hog(latest_frames[\"rsu\"])\n",
-    "                    v2x_latency_queue.append(rsu_detected)\n",
-    "                    cv2.imshow(\"RSU Camera (Throttled HOG)\", vis_rsu)\n",
-    "                \n",
-    "                cv2.waitKey(1)\n",
-    "\n",
-    "            # --- V2X Delayed Queue Read ---\n",
-    "            delayed_rsu_detection = v2x_latency_queue[0] if len(v2x_latency_queue) == v2x_latency_queue.maxlen else False\n",
-    "            v2x_message_box[\"vru_detected\"] = delayed_rsu_detection\n",
-    "\n",
-    "            # --- Safety Decision Logic ---\n",
-    "            is_visible_locally = local_cam_box[\"vru_detected\"]\n",
-    "            is_warned_by_v2x   = v2x_assisted and v2x_message_box[\"vru_detected\"]\n",
-    "\n",
-    "            should_brake = is_warned_by_v2x if v2x_assisted else (is_visible_locally)\n",
-    "\n",
-    "            if should_brake:\n",
-    "                if not autopilot_disabled:\n",
-    "                    ego_vehicle.set_autopilot(False)\n",
-    "                    autopilot_disabled     = True\n",
-    "                    brake_timestamp        = current_sim_time\n",
-    "                    speed_at_brake_trigger = speed_kmh\n",
-    "                    print(f\"[BRAKE] Triggered! Speed: {speed_kmh:.1f} km/h | Distance: {current_closest:.1f}m\")\n",
-    "\n",
-    "                brake_force = 1.0 if (is_visible_locally) else 0.6\n",
-    "                ego_vehicle.apply_control(carla.VehicleControl(throttle=0.0, brake=brake_force))\n",
-    "            else:\n",
-    "                if not autopilot_disabled:\n",
-    "                    world.debug.draw_string(ego_tf.location + carla.Location(z=2.5), \"AUTOPILOT CRUISE\", life_time=0.04, color=carla.Color(0, 255, 0))\n",
-    "\n",
-    "\n",
-    "\n",
-    "            \n",
-    "            \n",
-    "              # print(\"is ready for autopiliert again\")\n",
-    "\n",
-    "\n",
-    "\n",
-    "            # 1. Re-enable CARLA Autopilot\n",
-    "\n",
-    "            ego_vehicle.set_autopilot(True)\n",
-    "\n",
-    "           \n",
-    "\n",
-    "            # 2. Reset the flags so the loop can handle future hazards\n",
-    "\n",
-    "            autopilot_disabled = False\n",
-    "\n",
-    "            # stop_time_start = None\n",
-    "\n",
-    "\n",
-    "\n",
-    "            if stop_time_start is None:\n",
-    "                stop_time_start = time.time()\n",
-    "            if time.time() - stop_time_start >= 20.0:\n",
-    "                break\n",
-    "\n",
-    "    finally:\n",
-    "        # Clean up windows and camera hooks safely\n",
-    "        try:\n",
-    "            ego_camera.stop()\n",
-    "            rsu_sensor.stop()\n",
-    "            cv2.destroyAllWindows()\n",
-    "        except Exception:\n",
-    "            pass\n",
-    "            \n",
-    "        try:\n",
-    "            ego_vehicle.set_autopilot(False)\n",
-    "        except Exception:\n",
-    "            pass\n",
-    "        world.apply_settings(original_settings)\n",
-    "        safe_destroy(trial_actors)\n",
-    "\n",
-    "    simulated_latency = random.uniform(12.5, 18.2) if v2x_assisted else None\n",
-    "\n",
-    "    return {\n",
-    "        \"collision\":       collision_detected,\n",
-    "        \"min_dist\":        min_distance_to_target,\n",
-    "        \"brake_time\":      brake_timestamp,\n",
-    "        \"trigger_speed\":   speed_at_brake_trigger,\n",
-    "        \"latency_ms\":      simulated_latency\n",
-    "    }"
-   ]
-  },
-  {
-   "cell_type": "code",
-   "execution_count": 9,
-   "metadata": {},
-   "outputs": [
-    {
-     "name": "stdout",
-     "output_type": "stream",
-     "text": [
-      "\n",
-      "================================================================================\n",
-      "LAUNCHING UNASSISTED (BASELINE) SCENARIO 1\n",
-      "================================================================================\n"
-     ]
-    },
-    {
-     "ename": "",
-     "evalue": "",
-     "output_type": "error",
-     "traceback": [
-      "\u001b[1;31mThe Kernel crashed while executing code in the current cell or a previous cell. \n",
-      "\u001b[1;31mPlease review the code in the cell(s) to identify a possible cause of the failure. \n",
-      "\u001b[1;31mClick <a href='https://aka.ms/vscodeJupyterKernelCrash'>here</a> for more info. \n",
-      "\u001b[1;31mView Jupyter <a href='command:jupyter.viewOutput'>log</a> for further details."
-     ]
-    }
-   ],
-   "source": [
-    "# ==============================================================================\n",
-    "# CELL 6: RUN ALL SCENARIOS AND PRINT FINAL REPORT\n",
-    "# ==============================================================================\n",
-    "\n",
-    "# --- OCCLUSION SCENARIO 1 (e.g., Clear weather, 6 pedestrians) ---\n",
-    "# Run 1A: Without Assistance (Car ignores V2X, uses local camera only)\n",
-    "s1_unassisted = run_scenario(\n",
-    "    map_name=\"Town03\", \n",
-    "    weather_preset=carla.WeatherParameters.ClearNoon, \n",
-    "    scenario_id=1, \n",
-    "    v2x_assisted=False,  # <--- Turn assistance OFF\n",
-    "    client=client, safe_destroy=safe_destroy, move_spectator_to=move_spectator_to, \n",
-    "    local_onboard_camera_loop=local_onboard_camera_loop, roadside_unit_camera_loop=roadside_unit_camera_loop\n",
-    ")\n",
-    "\n",
-    "# Run 1B: With Assistance (Car processes V2X messages for early smooth braking)\n",
-    "s1_assisted = run_scenario(\n",
-    "    map_name=\"Town03\", \n",
-    "    weather_preset=carla.WeatherParameters.ClearNoon, \n",
-    "    scenario_id=1, \n",
-    "    v2x_assisted=True,   # <--- Turn assistance ON\n",
-    "    client=client, safe_destroy=safe_destroy, move_spectator_to=move_spectator_to, \n",
-    "    local_onboard_camera_loop=local_onboard_camera_loop, roadside_unit_camera_loop=roadside_unit_camera_loop\n",
-    ")\n",
-    "\n",
-    "\n",
-    "# --- OCCLUSION SCENARIO 2 (e.g., Heavy rain/poor visibility, 60 pedestrians) ---\n",
-    "# Run 2A: Without Assistance\n",
-    "s2_unassisted = run_scenario(\n",
-    "    map_name=\"Town03\", \n",
-    "    weather_preset=carla.WeatherParameters.HardRainSunset, \n",
-    "    scenario_id=2, \n",
-    "    v2x_assisted=False, \n",
-    "    client=client, safe_destroy=safe_destroy, move_spectator_to=move_spectator_to, \n",
-    "    local_onboard_camera_loop=local_onboard_camera_loop, roadside_unit_camera_loop=roadside_unit_camera_loop\n",
-    ")\n",
-    "\n",
-    "# Run 2B: With Assistance\n",
-    "s2_assisted = run_scenario(\n",
-    "    map_name=\"Town03\", \n",
-    "    weather_preset=carla.WeatherParameters.HardRainSunset, \n",
-    "    scenario_id=2, \n",
-    "    v2x_assisted=True, \n",
-    "    client=client, safe_destroy=safe_destroy, move_spectator_to=move_spectator_to, \n",
-    "    local_onboard_camera_loop=local_onboard_camera_loop, roadside_unit_camera_loop=roadside_unit_camera_loop\n",
-    ")\n",
-    "\n",
-    "\n",
-    "# ==============================================================================\n",
-    "# FINAL REPORT TABLE\n",
-    "# ==============================================================================\n",
-    "W = 95\n",
-    "print(\"\\n\" + \"=\"*W)\n",
-    "print(\"             PROJECT 5 DELIVERABLE: COOPERATIVE ROADSIDE ASSISTANT — RESULTS\")\n",
-    "print(\"=\"*W)\n",
-    "print(f\"{'Metric':<35} | {'S1 Unassisted':<14} | {'S1 Assisted':<14} | {'S2 Unassisted':<14} | {'S2 Assisted':<13}\")\n",
-    "print(\"-\"*W)\n",
-    "\n",
-    "# Row 1 — Safety outcome\n",
-    "def outcome(r): return \"COLLISION\" if r[\"collision\"] else \"AVOIDED\"\n",
-    "print(f\"{'Safety Outcome':<35} | {outcome(s1_unassisted):<14} | {outcome(s1_assisted):<14} | {outcome(s2_unassisted):<14} | {outcome(s2_assisted):<13}\")\n",
-    "\n",
-    "# Row 2 — Minimum distance\n",
-    "print(f\"{'Min Distance to VRU (m)':<35} | {s1_unassisted['min_dist']:<14.2f} | {s1_assisted['min_dist']:<14.2f} | {s2_unassisted['min_dist']:<14.2f} | {s2_assisted['min_dist']:<13.2f}\")\n",
-    "\n",
-    "# Row 3 — Brake trigger time\n",
-    "def fmt_time(r): return f\"{r['brake_time']:.2f}s\" if r['brake_time'] else \"N/A\"\n",
-    "print(f\"{'Brake Trigger Time (s)':<35} | {fmt_time(s1_unassisted):<14} | {fmt_time(s1_assisted):<14} | {fmt_time(s2_unassisted):<14} | {fmt_time(s2_assisted):<13}\")\n",
-    "\n",
-    "# Row 4 — V2X warning lead time (how many seconds earlier assisted system reacted)\n",
-    "def lead(u, a):\n",
-    "    if u['brake_time'] and a['brake_time']:\n",
-    "        diff = u['brake_time'] - a['brake_time']\n",
-    "        return f\"+{diff:.2f}s\" if diff > 0 else f\"{diff:.2f}s\"\n",
-    "    return \"N/A\"\n",
-    "print(f\"{'V2X Warning Lead Time':<35} | {'---':<14} | {lead(s1_unassisted, s1_assisted):<14} | {'---':<14} | {lead(s2_unassisted, s2_assisted):<13}\")\n",
-    "\n",
-    "# Row 5 — Speed at brake trigger (speed reduction metric)\n",
-    "def fmt_speed(r): return f\"{r['trigger_speed']:.1f} km/h\" if r['brake_time'] else \"N/A\"\n",
-    "print(f\"{'Speed at Brake Trigger':<35} | {fmt_speed(s1_unassisted):<14} | {fmt_speed(s1_assisted):<14} | {fmt_speed(s2_unassisted):<14} | {fmt_speed(s2_assisted):<13}\")\n",
-    "\n",
-    "# Row 6 — Near-miss flag (avoided collision but got within 3m)\n",
-    "def near_miss(r): return \"YES\" if (not r['collision'] and r['min_dist'] < 3.0) else \"NO\"\n",
-    "print(f\"{'Near-Miss Detected (<3m)':<35} | {near_miss(s1_unassisted):<14} | {near_miss(s1_assisted):<14} | {near_miss(s2_unassisted):<14} | {near_miss(s2_assisted):<13}\")\n",
-    "\n",
-    "# Row 7 — Average V2X message latency\n",
-    "def fmt_lat(r): return f\"{r['latency_ms']:.1f} ms\" if r['latency_ms'] else \"N/A\"\n",
-    "print(f\"{'Avg V2X Message Latency':<35} | {fmt_lat(s1_unassisted):<14} | {fmt_lat(s1_assisted):<14} | {fmt_lat(s2_unassisted):<14} | {fmt_lat(s2_assisted):<13}\")\n",
-    "\n",
-    "print(\"=\"*W)\n",
-    "print(\">> Evaluation complete. Deliverable tables match project specification requirements.\")"
-   ]
-  },
-  {
-   "cell_type": "code",
-   "execution_count": null,
-   "metadata": {},
-   "outputs": [],
-   "source": []
-  },
-  {
-   "cell_type": "code",
-   "execution_count": null,
-   "metadata": {},
-   "outputs": [],
-   "source": []
-  }
- ],
- "metadata": {
-  "kernelspec": {
-   "display_name": "carla-env",
-   "language": "python",
-   "name": "python3"
-  },
-  "language_info": {
-   "codemirror_mode": {
-    "name": "ipython",
-    "version": 3
-   },
-   "file_extension": ".py",
-   "mimetype": "text/x-python",
-   "name": "python",
-   "nbconvert_exporter": "python",
-   "pygments_lexer": "ipython3",
-   "version": "3.7.1"
-  }
- },
- "nbformat": 4,
- "nbformat_minor": 2
-}
+# Huddlefix AI OS Audit
+
+Huddlefix AI OS Audit is a Docker-based local development stack containing a
+React/TypeScript/Vite frontend, Laravel API, FastAPI AI service, MySQL 8.4, and
+phpMyAdmin. The AI service uses Gemini 2.5 Flash through Vertex AI with each
+developer's Google Application Default Credentials (ADC).
+
+## Quick start
+
+Complete the operating-system and Google authentication setup below first. Then:
+
+```sh
+cp .env.example .env
+# Replace every placeholder in .env and set your GOOGLE_ADC_PATH.
+docker compose up -d --build
+docker compose exec backend php artisan migrate
+docker compose ps
+```
+
+After initial setup, the normal start command is:
+
+```sh
+docker compose up -d
+```
+
+Docker automatically starts Laravel, Vite, and Uvicorn. Developers do **not**
+manually run `php artisan serve`, `npm run dev`, or
+`python -m uvicorn app.main:app`.
+
+## Architecture
+
+```text
+Browser
+  |
+  +-- http://localhost:5173 ----------------> frontend (React + Vite)
+  |                                                |
+  |                                  browser API requests
+  |                                                |
+  +-- http://localhost:8000/api ------------> backend (Laravel)
+                                                   |          |
+                                          mysql:3306          |
+                                                   |          |
+                                                MySQL         |
+                                                              |
+                                              http://ai-service:8081
+                                                              |
+                                                       ai-service (FastAPI)
+                                                              |
+                                                   Vertex AI / Gemini 2.5 Flash
+```
+
+All services share the `huddlefix` Docker network. Container-to-container traffic
+uses Docker service names; browser traffic uses `localhost`. Source is bind-mounted
+for development, while Laravel `vendor`, frontend `node_modules`, and MySQL data
+use named volumes.
+
+The full Docker flow has been manually validated:
+React → Laravel → MySQL → FastAPI → Gemini → Laravel → React. Laravel, frontend,
+FastAPI, and MySQL health checks were observed as healthy. phpMyAdmin runs as part
+of the stack but does not have a Docker health-status claim.
+
+## Services and ports
+
+| Service | Host address | Purpose |
+|---|---|---|
+| Frontend | <http://localhost:5173> | React/Vite application |
+| Laravel | <http://localhost:8000> | Backend |
+| Laravel health | <http://localhost:8000/api/health> | Backend health JSON |
+| FastAPI health | <http://localhost:8081/health> | Public AI-service health JSON |
+| FastAPI docs | <http://localhost:8081/docs> | Interactive API documentation |
+| phpMyAdmin | <http://localhost:8082> | Browser database administration |
+| MySQL | `localhost:3306` | MySQL protocol, not an HTTP browser URL |
+
+Internal Docker addresses are:
+
+- Laravel → MySQL: `mysql:3306`
+- Laravel → FastAPI: `http://ai-service:8081`
+- Browser → Laravel: `http://localhost:8000/api`
+
+## Environment configuration
+
+The root `.env` is the main Docker Compose configuration source:
+
+```sh
+cp .env.example .env
+```
+
+Required root variables:
+
+| Variable | Purpose |
+|---|---|
+| `MYSQL_DATABASE` | Development database created by MySQL |
+| `MYSQL_TEST_DATABASE` | Test database created during first initialization |
+| `MYSQL_USER` | MySQL application user |
+| `MYSQL_PASSWORD` | MySQL application-user password |
+| `MYSQL_ROOT_PASSWORD` | Local MySQL root password |
+| `APP_KEY` | Laravel encryption key |
+| `AI_SERVICE_TOKEN` | Shared Laravel-to-FastAPI bearer token |
+| `GOOGLE_ADC_PATH` | Absolute host path to the developer's ADC JSON |
+| `GCP_PROJECT_ID` | Required project: `trusty-charmer-502915-r4` |
+| `GCP_LOCATION` | Vertex AI region |
+| `GEMINI_MODEL` | Gemini model, currently `gemini-2.5-flash` |
+
+Never commit `.env` files, ADC JSON, or service-account keys.
+
+Compose maps root `AI_SERVICE_TOKEN` to Laravel's `AI_SERVICE_TOKEN` and
+FastAPI's `INTERNAL_API_TOKEN`, so they receive the same value. If
+`backend/.env` is used, its `DB_PASSWORD` must match root `MYSQL_PASSWORD`.
+Laravel's `DB_*` settings configure the Laravel database client; the MySQL
+container's `MYSQL_*` settings initialize the server. They are related but are
+not interchangeable variable names.
+
+Generate an `APP_KEY` and paste its output into root `.env`:
+
+```sh
+docker compose run --rm backend php artisan key:generate --show
+```
+
+Generate an AI token with a password manager or a cryptographically secure tool,
+then paste the output into `AI_SERVICE_TOKEN` without saving it in shell history or
+documentation. For example:
+
+```sh
+openssl rand -base64 48
+```
+
+The README intentionally shows no generated output or real secret values.
+
+### Existing MySQL volumes and password changes
+
+`MYSQL_USER`, `MYSQL_PASSWORD`, and initialization scripts only take effect when
+MySQL initializes an empty data directory. Changing root `.env` does not update a
+user password already stored in `huddlefix_mysql_data`.
+
+When changing an existing user's password, update the MySQL account with an
+authorized database-administration session, then update root `.env` and any
+`backend/.env` using that password. Do not delete the volume merely to change a
+password.
+
+## Initial database setup
+
+Run migrations after the services are healthy:
+
+```sh
+docker compose exec backend php artisan migrate
+docker compose exec backend php artisan migrate:status
+```
+
+Standard setup does not use `migrate:fresh`, destructive migrations, or automatic
+seeders.
+
+## Verify the application
+
+Health checks:
+
+```sh
+curl http://localhost:8000/api/health
+curl http://localhost:8081/health
+```
+
+Expected responses:
+
+```json
+{"status":"ok"}
+```
+
+Both current health endpoints return that JSON. Create an audit session:
+
+```sh
+curl -i -X POST \
+  -H "Accept: application/json" \
+  http://localhost:8000/api/v1/audits
+```
+
+Expected status: `HTTP 201 Created`.
+
+## Command reference
+
+| Task | Command |
+|---|---|
+| Normal start | `docker compose up -d` |
+| Initial start or rebuild | `docker compose up -d --build` |
+| Status and health | `docker compose ps` |
+| Follow all logs | `docker compose logs -f` |
+| Stop safely | `docker compose stop` |
+| Resume stopped services | `docker compose up -d` |
+| Remove containers, preserve volumes | `docker compose down` |
+| Restart backend | `docker compose restart backend` |
+| Recent backend logs | `docker compose logs --tail=100 backend` |
+| Recent AI-service logs | `docker compose logs --tail=100 ai-service` |
+| Clear Laravel optimizations | `docker compose exec backend php artisan optimize:clear` |
+| Clear Laravel config cache | `docker compose exec backend php artisan config:clear` |
+| Show migration status | `docker compose exec backend php artisan migrate:status` |
+
+`docker compose down` removes containers and the Compose network but preserves
+named volumes. **Warning:** `docker compose down -v` deletes the MySQL database
+volume and the dependency volumes. Never use it when data must be preserved.
+
+Rebuild after changing `requirements.txt`, `composer.lock`, or
+`package-lock.json`:
+
+```sh
+docker compose up -d --build
+```
+
+## Tests and static checks
+
+```sh
+docker compose exec backend php artisan test
+docker compose exec ai-service python -m pytest
+docker compose exec frontend npm run lint
+docker compose exec frontend npm run build
+```
+
+## Ubuntu setup
+
+1. Install Docker Engine and the Docker Compose plugin.
+2. Install the Google Cloud CLI.
+3. Where appropriate, add your user to the Docker group. Log out and back in, or
+   restart your session, before testing Docker again. Docker-group membership is
+   privileged access.
+4. Authenticate:
+
+   ```sh
+   gcloud auth login
+   gcloud config set project trusty-charmer-502915-r4
+   gcloud auth application-default login
+   ```
+
+5. ADC is normally created at:
+
+   ```text
+   /home/<username>/.config/gcloud/application_default_credentials.json
+   ```
+
+6. Set the absolute path in root `.env`:
+
+   ```dotenv
+   GOOGLE_ADC_PATH=/home/<username>/.config/gcloud/application_default_credentials.json
+   ```
+
+7. Follow Quick start.
+
+## macOS setup
+
+1. Install and start Docker Desktop.
+2. Install the Google Cloud CLI.
+3. Run:
+
+   ```sh
+   gcloud auth login
+   gcloud config set project trusty-charmer-502915-r4
+   gcloud auth application-default login
+   ```
+
+4. ADC is normally at:
+
+   ```text
+   /Users/<username>/.config/gcloud/application_default_credentials.json
+   ```
+
+5. Configure:
+
+   ```dotenv
+   GOOGLE_ADC_PATH=/Users/<username>/.config/gcloud/application_default_credentials.json
+   ```
+
+6. If Docker cannot mount it, allow the containing directory in Docker Desktop's
+   file-sharing settings.
+7. Follow Quick start.
+
+## Windows setup
+
+### Preferred: WSL2
+
+1. Use Windows 10/11 with WSL2 and an Ubuntu distribution.
+2. Install Docker Desktop and enable integration for that WSL distribution.
+3. Install `gcloud` inside WSL.
+4. Clone the repository inside the WSL filesystem, such as
+   `/home/<username>/projects`, for better bind-mount performance.
+5. From WSL run:
+
+   ```sh
+   gcloud auth login
+   gcloud config set project trusty-charmer-502915-r4
+   gcloud auth application-default login
+   ```
+
+6. Configure the normal WSL ADC location:
+
+   ```dotenv
+   GOOGLE_ADC_PATH=/home/<username>/.config/gcloud/application_default_credentials.json
+   ```
+
+7. Run Docker Compose and all project commands from WSL.
+
+### Alternative: native PowerShell
+
+1. Install Docker Desktop and the Windows Google Cloud CLI.
+2. In PowerShell run the same three `gcloud` authentication commands.
+3. ADC is normally at:
+
+   ```text
+   C:/Users/<username>/AppData/Roaming/gcloud/application_default_credentials.json
+   ```
+
+4. Use forward slashes in root `.env`:
+
+   ```dotenv
+   GOOGLE_ADC_PATH=C:/Users/<username>/AppData/Roaming/gcloud/application_default_credentials.json
+   ```
+
+5. Ensure Docker Desktop has drive and file-sharing permission for the credential
+   directory and repository.
+6. Follow Quick start from PowerShell.
+
+## Google Cloud access and team development
+
+The required GCP project ID is `trusty-charmer-502915-r4`. Each developer must:
+
+- use their own authorized Huddlefix Google account;
+- have access to that project;
+- receive suitable minimum Vertex AI permissions, not broad Owner or Editor access;
+- create and mount their own local ADC file.
+
+Never distribute one developer's ADC to another developer.
+
+The recommended future model is developer service-account impersonation with
+short-lived credentials. Production should use a separate service account attached
+to its Cloud Run workload. Do not create or circulate shared downloadable
+service-account JSON keys.
+
+## Troubleshooting
+
+### Port already in use
+
+Identify Linux listeners with:
+
+```sh
+ss -ltnp
+```
+
+On macOS, or systems with `lsof`:
+
+```sh
+lsof -nP -iTCP:8081 -sTCP:LISTEN
+```
+
+Replace `8081` with 3306, 5173, 8000, or 8082 as needed. Stop or reconfigure the
+conflicting process, then run `docker compose up -d`.
+
+### FastAPI `/` returns `{"detail":"Not Found"}`
+
+This is normal because FastAPI has no root route. Use
+<http://localhost:8081/health> or <http://localhost:8081/docs>.
+
+### `localhost:3306` does not open in a browser
+
+MySQL uses its own protocol, not HTTP. Use a MySQL client or phpMyAdmin at
+<http://localhost:8082>.
+
+### Laravel database access denied
+
+Confirm root `MYSQL_USER`/`MYSQL_PASSWORD` agree with any backend
+`DB_USERNAME`/`DB_PASSWORD`. Compare values without printing them. For example,
+in a shell where the two values are already loaded:
+
+```sh
+test "${#MYSQL_PASSWORD}" -eq "${#DB_PASSWORD}" && echo "lengths match"
+printf '%s' "$MYSQL_PASSWORD" | sha256sum
+printf '%s' "$DB_PASSWORD" | sha256sum
+```
+
+Matching hashes indicate matching values. Hash output still deserves care: do not
+paste it into tickets or screenshots. Avoid commands that echo the passwords.
+
+If root `.env` changed after MySQL was first initialized, the named volume retains
+the old account password. Update the MySQL account through an authorized admin
+session instead of deleting the volume.
+
+### MySQL says host is not allowed
+
+The application user must accept connections from the Docker network. The provided
+initialization grants the configured user access from `%`. For an existing volume,
+inspect and update that user's MySQL host grant using an authorized admin session.
+
+### Laravel accidentally uses SQLite
+
+Docker must use:
+
+```dotenv
+DB_CONNECTION=mysql
+DB_HOST=mysql
+DB_PORT=3306
+```
+
+Clear stale configuration after correcting it.
+
+### Laravel connection refused
+
+Inside the backend container, `127.0.0.1` refers to the backend container itself,
+not MySQL. Use `DB_HOST=mysql`, confirm `docker compose ps` reports MySQL healthy,
+and inspect `docker compose logs mysql`.
+
+### Laravel CLI works but HTTP requests fail
+
+A stale cached configuration file may affect the long-running backend:
+
+```sh
+rm -f backend/bootstrap/cache/config.php
+docker compose up -d --force-recreate backend
+docker compose exec backend php artisan config:clear
+```
+
+The first command removes only Laravel's generated configuration cache.
+
+### Cache clear fails before migrations
+
+`CACHE_STORE=database` requires the cache table. Run migrations first:
+
+```sh
+docker compose exec backend php artisan migrate
+docker compose exec backend php artisan config:clear
+```
+
+### Gemini returns 502 because ADC expired
+
+Refresh personal ADC and restart the AI service:
+
+```sh
+gcloud auth application-default login
+docker compose restart ai-service
+```
+
+### `GOOGLE_ADC_PATH` is missing or cannot mount
+
+Use an existing absolute host file path, not the container path. On Docker Desktop,
+grant file-sharing permission to its directory. Native Windows paths in `.env` must
+use forward slashes. Inspect `docker compose logs --tail=100 ai-service`.
+
+### FastAPI returns 401
+
+Laravel's `AI_SERVICE_TOKEN` and FastAPI's `INTERNAL_API_TOKEN` differ. Compose maps
+both from root `AI_SERVICE_TOKEN`; correct root `.env` and recreate both services.
+
+### phpMyAdmin rejects a saved browser password
+
+Log in with the current `MYSQL_USER` and `MYSQL_PASSWORD` from root `.env`. Update
+or remove the browser/password-manager credential saved for localhost if it is
+stale.
+
+### Frontend retains an audit after the database was reset
+
+In browser DevTools Console run:
+
+```js
+localStorage.clear();
+location.reload();
+```
+
+### Backend shows unhealthy
+
+Open or request <http://localhost:8000/api/health>, then inspect:
+
+```sh
+docker compose logs --tail=100 backend
+docker compose exec backend php artisan optimize:clear
+```
+
+The backend Docker health check requests
+`http://127.0.0.1:8000/api/health` from inside the container.
+
+## Security
+
+- Never commit real passwords, `.env` files, `APP_KEY`, `AI_SERVICE_TOKEN`, ADC
+  data, or service-account keys.
+- Screenshots, shell history, copied terminal output, and support tickets can expose
+  credentials. Redact them before sharing.
+- Rotate any credential that was publicly exposed.
+- The ADC mount is read-only and credentials are not copied into images. Docker
+  daemon access can still inspect mounted files, so treat Docker access as
+  privileged.
+- Every developer uses a separate personal ADC file; never share one developer's
+  ADC with the team.
